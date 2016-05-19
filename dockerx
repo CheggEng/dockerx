@@ -1,0 +1,448 @@
+#!/usr/bin/env python
+
+import argparse
+import shutil
+from json import loads
+from sys import stderr, argv
+
+from utils.extras import *
+
+
+def flatten(args):
+    parser = argparse.ArgumentParser()
+    parser.add_argument('source', nargs=1, help='Source image name')
+    parser.add_argument('target', nargs="?", help='Target image name')
+    args = parser.parse_args(args)
+
+    source = args.source[0]
+    if args.target is None or len(args.target) == 0:
+        target = source
+    else:
+        target = args.target
+
+    desc = loads(
+        dockerRead("docker inspect {image}".format(image=source), connect=docker_connect))
+
+    commit_instructions = []
+    inspectImage(descriptor=desc, key=Constants.Docker.Inspect.ENTRYPOINT, list=commit_instructions,
+                 command="ENTRYPOINT")
+    inspectImage(descriptor=desc, key=Constants.Docker.Inspect.CMD, list=commit_instructions,
+                 command="CMD")
+
+    cmd = desc[0]["Config"][Constants.Docker.Inspect.LABEL]
+    if cmd is not None:
+        for element in cmd:
+            commit_instructions.append(
+                "LABEL {key} \"{value}\"".format(key=element, value=cmd[element].replace('"', '\\"')))
+
+    cmd = desc[0]["Config"][Constants.Docker.Inspect.ENV]
+    if cmd is not None:
+        for element in cmd:
+            elements = element.split('=')
+            elements[0] = elements[0].rstrip().lstrip()
+            elements[1] = elements[1].rstrip().lstrip()
+            commit_instructions.append(
+                "ENV {key}=\"{value}\"".format(key=elements[0], value=elements[1].replace('"', '\\"')))
+
+    # Generate docker command to create a container, and execute the generated shell script
+    docker_run = Constants.Docker.CREATE
+    docker_run += " {image}".format(image=source)
+
+    container_id = dockerRead(docker_run, connect=docker_connect).rstrip('\n')
+    log("Running the container: {0}".format(container_id))
+    # Run created docker container
+    dockerExec(Constants.Docker.RUN.format(container_id), connect=docker_connect)
+
+    # Exporting container filesystem
+    dockerExec(Constants.Docker.EXPORT.format(container_id=container_id), connect=docker_connect)
+
+    # Re-importing the container. Applying ENV, ENTRYPOINT, CMD and LABEL instructions
+    docker_import = Constants.Docker.IMPORT
+    # Pass all commit instructions
+    for commit_instruction in commit_instructions:
+        docker_import += "-c '{0}' ".format(commit_instruction)
+
+    docker_import += " {container_id}.tar.gz {image_name}".format(container_id=container_id,
+                                                                  image_name=target)
+    log(docker_import)
+    # Parsing image id from the resonse of "docker commit" command. Response format is <hash-algorithm>:<image-id>
+    dockerRead(docker_import, connect=docker_connect).rstrip('\n').split(':', 1)[1]
+    # Remove the container
+    dockerExec(Constants.Docker.REMOVE_CONTAINER.format(container_id), connect=docker_connect)
+
+
+def build(args):
+    if len(args) <= 0:
+        stderr.writelines(
+            ["usage: dockerx build [options] path. Run \"docker build --help\" for more details\n",
+             "path is required\n"])
+        os._exit(1)
+
+    path = args[-1]
+
+    options = args[0:-1]
+
+    # Parsing command line arguments, extracting volume mounts, image name and build arguments
+
+    # Searching for --opts-file parameters, extracting options from file and expanding command line arguments
+    options = checkOptsFile(options)
+
+    volume_commands = []
+    build_args = []
+    optionTag = Option(option_short="-t", option_long="--tag", supports_equal=True)
+    optionVolume = Option(option_short="-v", option_long="--volume", supports_equal=True, cleanup=True,
+                          single_instance=False)
+    optionBuildArg = Option(option_short=None, option_long="--build-arg", supports_equal=True, single_instance=False)
+    optionMemory = Option(option_short="-m", option_long="--memory", supports_equal=True)
+    optionCpu = Option(option_short="-c", option_long="--cpu-shares", supports_equal=True)
+    optionRegistry = Option(option_short=None, option_long="--registry", supports_equal=True, cleanup=True)
+    optionDockerfile = Option(option_short="-f", option_long="--file", supports_equal=True, cleanup=True)
+
+    global_options = OptionSet(
+        [optionTag, optionVolume, optionBuildArg, optionMemory, optionCpu, optionRegistry, optionDockerfile])
+
+    for i in range(0, len(options)):
+        global_options.find(options, i)
+
+    for value in optionVolume.values:
+        volume_parts = value.split(":", 1)
+        if len(volume_parts) > 1:
+            volume_local = volume_parts[0]
+            if volume_local[0] == '.' or (volume_local[0] != '/' and volume_local[0] != '~'):
+                volume_local = os.path.abspath(os.path.join(os.getcwd(), volume_local))
+            volume = volume_local + ":" + volume_parts[1]
+        else:
+            volume = volume_parts[0]
+        volume_commands.append(volume)
+
+    for value in optionBuildArg.values:
+        build_args.append(KeyValue(value))
+
+    # Reading Dockerfile
+    if optionDockerfile.found():
+        docker_file_path = optionDockerfile.value
+    else:
+        filename = Constants.Docker.BASE_DOCKER_FILE_NAME
+        docker_file_path = os.path.join(path, filename)
+
+    if not os.path.exists(docker_file_path):
+        raise OSError("File not found: {0}".format(docker_file_path))
+
+    file = open(docker_file_path, 'r')
+    dockerfile = file.readlines()
+    file.close()
+
+    cached = []
+    not_cached = []
+
+    noCache = False
+
+    extra_commands = Commands()
+
+    # Verifying Dockerfile, separating build- and run-time parts
+    for line in dockerfile:
+        line = line.strip()
+        if line != None and line != '':
+            if not noCache:
+                if line == Constants.RUNTIME:
+                    noCache = True
+                elif line[0] != '#':
+                    cached.append(line)
+            elif line[0:2] == '#!' or line[0] != '#':
+                not_cached.append(line)
+
+    # Parsing build time commands. If command is CMD or ENTRYPOINT, it has to be duplicated in "docker commit". If command is USER, it has to be considered in the runtime script
+    commit_instructions = []
+    post_commit_instructions = []
+    script = DockerScript(build_args)
+    in_su_mode = False
+    has_cmd = False
+    has_entrypoint = False
+    for i in range(0, len(cached)):
+        line = cached[i]
+        command_line = line.split(' ', 1)
+        if len(command_line) < 2:
+            raise ValueError("Invalid Docker command: {0}".format(line))
+        command = command_line[0]
+        if command in ['CMD', 'ENTRYPOINT']:
+            commit_instructions.append(line)
+            if command == 'CMD':
+                has_cmd = True
+            if command == 'ENTRYPOINT':
+                has_entrypoint = True
+        elif command == 'USER':
+            if command_line[1] == "root":
+                in_su_mode = False
+            else:
+                in_su_mode = True
+                last_command = line
+        elif command == 'FROM':
+            from_name = command_line[1]
+            if optionRegistry.found() and len(from_name.split('/')) <= 2 and not from_name.startswith(
+                    optionRegistry.value):
+                cached[i] = 'FROM {0}/{1}'.format(optionRegistry.value, from_name)
+
+    if in_su_mode:
+        not_cached = [last_command] + not_cached
+
+    workdir_instruction = None
+    # Parse runtime commands, convert them to a shell script. If command is ADD, move it to build time instructions. If command is ENV, copy it in commit instructions.
+    for line in not_cached:
+        command_line = line.split(' ', 1)
+        command = command_line[0]
+        if command == 'RUN':
+            script.add(command_line[1])
+        elif command == 'WORKDIR':
+            script.add("cd {0}".format(command_line[1]))
+            workdir_instruction = line
+        elif command == 'USER':
+            if command_line[1] == "root":
+                script.root()
+            else:
+                script.su(command_line[1])
+        elif command == "ADD":
+            cached.append(line)
+        elif command == 'ENV':
+            key_value = KeyValue(command_line[1])
+            script.add('export {0}="{1}"'.format(key_value.key, key_value.value))
+            commit_instructions.append(line)
+        elif extra_commands.exists(command):
+            for build_arg in build_args:
+                line = line.replace("${{{0}}}".format(build_arg.key), build_arg.value)
+            post_commit_instructions.append(line)
+        elif line[0] != '#':
+            commit_instructions.append(line)
+            if command == 'CMD':
+                has_cmd = True
+            if command == 'ENTRYPOINT':
+                has_entrypoint = True
+
+    if workdir_instruction != None:
+        commit_instructions.append(workdir_instruction)
+
+    if len(script.lines()) > 0:
+        # If build instructions switch the user, restore root session, and notify runtime shell script about USER command
+        if in_su_mode:
+            cached.append(newline('USER root'))
+            in_su_mode = False
+
+        # Write shell script
+        script_file_name = os.path.join(path, Constants.Docker.RUNTIME_DOCKER_FILE_NAME)
+        script_file = open(script_file_name, 'w')
+        script_file.write(Constants.Shell.SCRIPT_HEAD)
+        script_file.write(Constants.Shell.FAIL_ON_ERROR)
+        script_file.writelines(script.lines())
+        script_file.close()
+
+        # Replacing image name in command line arguments with temporary ID
+        image_name = DockerImageName(optionTag.value)
+        if optionTag.found():
+            if len(optionTag.option_indexes) > 1:
+                options[optionTag.option_indexes[-1]] = image_name.tmp_image_name
+            else:
+                options[optionTag.option_indexes[0]] = "{0}={1}".format(optionTag.option_long,
+                                                                        image_name.tmp_image_name)
+        else:
+            options.append("--tag={0}".format(image_name.tmp_image_name))
+        # Add generated shell script into the container.
+        cached.append(Constants.Docker.Dockerfile.ADD_RUNTIME_SCRIPT_COMMAND.format(image_name.tmp_image_name))
+    elif optionRegistry.found() and optionTag.found():
+        if len(optionTag.option_indexes) > 1:
+            argument_image_name = options[optionTag.option_indexes[-1]]
+        else:
+            argument_image_name = options[optionTag.option_indexes[0]].split('=')
+        if len(argument_image_name.split('/')) <= 2 and not argument_image_name.startswith(optionRegistry.value):
+            argument_image_name = "{0}/{1}".format(optionRegistry.value, argument_image_name)
+        if len(optionTag.option_indexes) > 1:
+            options[optionTag.option_indexes[-1]] = argument_image_name
+        else:
+            options[optionTag.option_indexes[0]] = "{0}={1}".format(optionTag.option_long, argument_image_name)
+
+    # Write Dockerfile build time instructions
+    cached_file_name = os.path.join(path, Constants.Docker.STATIC_DOCKER_FILE_NAME)
+    if not os.path.exists(cached_file_name):
+        cached_file = open(cached_file_name, 'w')
+        for line in cached:
+            cached_file.write(line + "\n")
+        cached_file.close()
+    else:
+        cached_file = open(cached_file_name, 'r+')
+        cached_file.seek(0)
+        for line in cached:
+            cached_file.write(line + "\n")
+        cached_file.truncate()
+        cached_file.close()
+
+    # Generate docker build command. Pass all command line arguments except -v anv --volume. Force docker to use generated build time instruction file df.c instead of Dockerfile
+    docker_build = Constants.Docker.BUILD
+    for option in options:
+        if option != "":
+            docker_build += "{0} ".format(option)
+    docker_build += "-f {file} {path}".format(file=cached_file_name, path=path)
+
+    # Execute docker build
+    dockerExec(docker_build, docker_connect)
+
+    if len(script.lines()) > 0:
+        # docker commit does not preserve CMD and ENTRYPOINT settings.
+        # If there's no CMD or ENTRYPOINT command in the Dockerfile, inspect the temporary image for these instructions
+        # passed from the parent image, and include them into the commit instructions.
+        if not (has_cmd and has_entrypoint):
+            desc = loads(
+                dockerRead("docker inspect {image}".format(image=image_name.tmp_image_name), connect=docker_connect))
+
+            if not has_entrypoint:
+                inspectImage(descriptor=desc, key=Constants.Docker.Inspect.ENTRYPOINT, list=commit_instructions,
+                             command="ENTRYPOINT")
+
+            if not (has_entrypoint or has_cmd):
+                inspectImage(descriptor=desc, key=Constants.Docker.Inspect.CMD, list=commit_instructions,
+                             command="CMD")
+
+        # Generate docker command to create a container, and execute the generated shell script
+        docker_run = Constants.Docker.CREATE
+        # Pass all volume mounts
+        for volume_command in volume_commands:
+            docker_run += "-v {0} ".format(volume_command)
+        if optionMemory.found():
+            docker_run += "--memory={0} ".format(optionMemory.value)
+        if optionCpu.found():
+            docker_run += "--cpu-shares={0} ".format(optionCpu.value)
+        docker_run += "{0} /{0}.sh ".format(image_name.tmp_image_name)
+        # Pass all used build arguments as shell script arguments
+        for build_arg in build_args:
+            docker_run += "{0} ".format(build_arg.value)
+
+        log(docker_run)
+        container_id = dockerRead(docker_run, connect=docker_connect).rstrip('\n')
+        log("Running the container: {0}".format(container_id))
+        # Run created docker container
+        dockerExec(Constants.Docker.RUN.format(container_id), connect=docker_connect)
+
+        # Commit the container after run, and save it with desired image name
+        docker_commit = Constants.Docker.COMMIT
+        # Pass all commit instructions
+        for commit_instruction in commit_instructions:
+            docker_commit += "-c '{0}' ".format(commit_instruction)
+
+        if optionRegistry.found() and not image_name.original_image_name.startswith(optionRegistry.value):
+            image_name.original_image_name = '{0}/{1}'.format(optionRegistry.value, image_name.original_image_name)
+
+        docker_commit += " {container_id} {image_name}".format(container_id=container_id,
+                                                               image_name=image_name.original_image_name)
+        log(docker_commit)
+        # Parsing image id from the resonse of "docker commit" command. Response format is <hash-algorithm>:<image-id>
+        image_id = dockerRead(docker_commit, connect=docker_connect).rstrip('\n').split(':', 1)[1]
+        # Remove the container
+        dockerExec(Constants.Docker.REMOVE_CONTAINER.format(container_id), connect=docker_connect)
+        # Remove temporary image
+        dockerExec(Constants.Docker.REMOVE_IMAGE.format(image_name.tmp_image_name), connect=docker_connect)
+
+        extra_commands_context = dict()
+        extra_commands_context["image-name"] = image_name.original_image_name
+        extra_commands_context["image-id"] = image_id
+        for command in post_commit_instructions:
+            extra_commands.execute(command, extra_commands_context)
+
+
+def patch(args):
+    image_name = args[-1]
+
+    options = args[0:-1]
+
+    optionCommand = Option(option_short=None, option_long="--command", supports_equal=True)
+    optionTag = Option(option_short="-t", option_long="--tag", supports_equal=True)
+
+    commands = []
+
+    for i in range(0, len(options)):
+        option = options[i]
+        optionCommand.verify(option, i)
+        if optionCommand.found():
+            if not optionCommand.value.startswith("FROM "):
+                commands.append(optionCommand.value)
+            for idx in optionCommand.option_indexes:
+                options[idx] = ""
+            optionCommand.reset()
+        # Removing image tag commands
+        optionTag.verify(option, i)
+        if optionTag.found():
+            for idx in optionCommand.option_indexes:
+                options[idx] = ""
+            optionTag.reset()
+
+    commands.insert(0, "FROM {0}".format(image_name))
+
+    folder_name = str(uuid4())
+    os.mkdir(folder_name)
+    docker_file = open("{0}/Dockerfile".format(folder_name), "w")
+    for cmd in commands:
+        docker_file.write(cmd + "\n")
+    docker_file.close()
+
+    dockerfile_path = os.path.abspath(folder_name)
+
+    opts = []
+
+    for option in options:
+        if option != '':
+            opts.append(option)
+
+    opts.append("-t")
+    opts.append(image_name)
+    opts.append(dockerfile_path)
+
+    build(opts)
+
+    shutil.rmtree(dockerfile_path)
+
+
+def run(args):
+    options = checkOptsFile(args)
+    options.insert(0, "docker run")
+    callDocker(options)
+
+
+def callDocker(args):
+    cmd = ""
+    for element in args:
+        element = element.replace("\"", "\\\"")
+        cmd += element + " "
+    dockerExec(cmd, connect=docker_connect)
+
+
+if len(argv) == 1 or (len(argv) == 2 and argv[1] == "--help"):
+    log("Usage format: dockerx <COMMAND> [OPTIONS]")
+    log("Supported commands:")
+    log("* build - calls regular docker build; supported additional options:")
+    log("    -v, --volume - mount host volumes during build process")
+    log("    --registry   - add custom registry prefix to image names")
+    log("    --opts-file  - use arguments from options file")
+    log("* patch - allows to patch existing Docker image; format:")
+    log(
+        "    dockerx patch [BUILD OPTIONS] --command '<DOCKER-INSTRUCTION>' [--command '<DOCKER-INSTRUCTION>'...] <IMAGE_NAME>")
+    log("* flatten - reduces size of Docker images; format:")
+    log("    dockerx flatten <IMAGE_NAME> [<TARGET_IMAGE_NAME>]")
+    log("\nIf command not found, it will be passed to the regular docker script")
+    os._exit(1)
+
+command = argv[1]
+
+func = None
+
+if command == 'build':
+    func = build
+elif command == 'flatten':
+    func = flatten
+elif command == 'patch':
+    func = patch
+elif command == 'run':
+    func = run
+
+if func is not None:
+    args = argv[2:]
+    func(args)
+else:
+    args = argv
+    args[0] = "docker"
+    callDocker(args)
