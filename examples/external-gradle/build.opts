@@ -1,0 +1,4 @@
+-v ~/docker-mount/jdk1.7.0_79:/jdk
+-v ~/docker-mount/gradle:/gradle
+-v ./hello:/src
+-m 256m
