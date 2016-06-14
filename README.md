@@ -6,6 +6,7 @@
 - put build parameters into an options file
 - patch existing images using command line instructions
 - flatten Docker images
+- remove images based on regular expression
 
 **dockerx** extends functionality of **build**, and adds commands **patch** and **flatten**.
 If command is not recognized by **dockerx**, it will pass the command with all arguments to regular **docker** tool.
@@ -86,3 +87,13 @@ After creating a **Dockerfile**, script will internally call **dockerx build**, 
 <pre>dockerx flatten &lt;IMAGE_NAME&gt; [&lt;TARGET_IMAGE_NAME&gt;]</pre>
 ### How it works?
 **dockerx** will inspect the source image, and extract the metadata. Then **dockerx** will start a new container based on the source image, export it using **docker export**, re-import it back as a target image. If target image name is not provided, **dockerx** will overwrite the source image. While importing, **dockerx** will apply the saved metadata.
+
+
+## rmi
+**dockerx rmi** removes images based on a regex mask and exclude list. Usage:
+<pre>dockerx [-x &lt;EXCLUDED_IMAGE_NAME&gt;] &lt;IMAGE_NAME_MASK&gt;</pre>
+Example:
+<pre>dockerx rmi -x my-project:latest my-project:.*</pre>
+It supports all regular options of **docker rmi**. 
+### How it works?
+**dockerx** will list all images, find matching names, exclude specified images, and will remove the rest. 
