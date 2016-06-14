@@ -397,6 +397,40 @@ def patch(args):
     shutil.rmtree(dockerfile_path)
 
 
+def rmi(args):
+    image_name = args[-1]
+
+    options = args[0:-1]
+
+    optionExclude = Option(option_short="-x", option_long="--exclude", supports_equal=True)
+
+    excluded = []
+
+    for i in range(0, len(options)):
+        option = options[i]
+        optionExclude.verify(option, i)
+        if optionExclude.found():
+            excluded.append(optionExclude.value.lower())
+            for idx in optionExclude.option_indexes:
+                options[idx] = ""
+            optionExclude.reset()
+
+    image_names = dockerRead("docker images --format \"{{.Repository}}:{{.Tag}}\"",
+                             connect=docker_connect, display_output=False).rstrip().split("\n")
+
+    opts = ""
+    for option in options:
+        if option != "":
+            if opts != "":
+                opts += " "
+            opts += option
+
+    for image in image_names:
+        if re.match(image_name, image) and (image.lower() not in excluded):
+            dockerExec("docker rmi {opts} {image}".format(opts=opts, image=image), connect=docker_connect,
+                       fail_on_error=False)
+
+
 def run(args):
     options = checkOptsFile(args)
     options.insert(0, "docker run")
@@ -438,6 +472,8 @@ elif command == 'patch':
     func = patch
 elif command == 'run':
     func = run
+elif command == 'rmi':
+    func = rmi
 
 if func is not None:
     args = argv[2:]

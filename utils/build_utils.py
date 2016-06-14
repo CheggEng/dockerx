@@ -202,7 +202,7 @@ def newline(text):
 
 
 # Executes OS command using os.system() in given working directory, logs the command and verifies the exit code
-def sh(command, directory=None, command_line=None):
+def sh(command, directory=None, command_line=None, fail_on_error=True):
     if directory == None:
         log(command)
     else:
@@ -214,7 +214,7 @@ def sh(command, directory=None, command_line=None):
     if command_line is not None:
         command = command_line.format(command)
     exitCode = os.system(command)
-    if exitCode != 0:
+    if exitCode != 0 and fail_on_error:
         raise OSError(exitCode)
     if directory != None:
         os.chdir(currentPath)
@@ -267,20 +267,21 @@ class DictPathAccess:
         return self.get(path) != None
 
 
-def dockerExec(command, connect=False):
+def dockerExec(command, connect=False, fail_on_error=True):
     if connect:
         command_line = "(eval \"$(docker-machine env --shell=bash default)\";{0})"
     else:
         command_line = None
-    sh(command, command_line=command_line)
+    sh(command, command_line=command_line, fail_on_error=fail_on_error)
 
 
-def dockerRead(command, connect=False):
+def dockerRead(command, connect=False, display_output=True):
     log(command)
     if connect:
         command = "(eval \"$(docker-machine env --shell=bash default)\";{cmd})".format(cmd=command)
     res = subprocess.check_output(command, shell=True)
-    log(res)
+    if display_output:
+        log(res)
     return res
 
 
