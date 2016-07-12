@@ -97,9 +97,11 @@ def build(args):
     optionCpu = Option(option_short="-c", option_long="--cpu-shares", supports_equal=True)
     optionRegistry = Option(option_short=None, option_long="--registry", supports_equal=True, cleanup=True)
     optionDockerfile = Option(option_short="-f", option_long="--file", supports_equal=True, cleanup=True)
+    optionFrom = Option(option_short=None, option_long="--from", supports_equal=True, cleanup=True)
 
     global_options = OptionSet(
-        [optionTag, optionVolume, optionBuildArg, optionMemory, optionCpu, optionRegistry, optionDockerfile])
+        [optionTag, optionVolume, optionBuildArg, optionMemory, optionCpu, optionRegistry, optionDockerfile,
+         optionFrom])
 
     for i in range(0, len(options)):
         global_options.find(options, i)
@@ -178,9 +180,12 @@ def build(args):
                 last_command = line
         elif command == 'FROM':
             from_name = command_line[1]
+            if optionFrom.found():
+                from_name = optionFrom.value
             if optionRegistry.found() and len(from_name.split('/')) <= 2 and not from_name.startswith(
                     optionRegistry.value):
-                cached[i] = 'FROM {0}/{1}'.format(optionRegistry.value, from_name)
+                from_name = '{0}/{1}'.format(optionRegistry.value, from_name)
+            cached[i] = 'FROM {0}'.format(from_name)
 
     if in_su_mode:
         not_cached = [last_command] + not_cached

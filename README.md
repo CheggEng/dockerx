@@ -4,6 +4,7 @@
 - use volume mounts during build
 - point to a custom Docker registry by default
 - put build parameters into an options file
+- override base image name during build
 - patch existing images using command line instructions
 - flatten Docker images
 - remove images based on regular expression
@@ -37,7 +38,8 @@ Script supports all arguments of regular docker build command, and following add
 
 *   **-v**, **--volume**: mount an external volume (see **docker run** docs for more details)
 *   **--opts-file**: loads command line arguments from a specified file; all arguments can be stored in opts file except path to **Dockerfile**
-*   **--registry**: use private registry instead of DockerHub without changing your **Dockerfile**; script will update base image name in **FROM** instruction, and will also apply new registry to the output image name 
+*   **--registry**: use private registry instead of DockerHub without changing your **Dockerfile**; script will update base image name in **FROM** instruction, and will also apply new registry to the output image name
+*   **--from**: override base image name in your **Dockerfile**; script will replace base image name in **FROM** instruction. Can be combined with **--registry**  
 
 ### Special cases
 
