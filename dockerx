@@ -7,9 +7,10 @@ from sys import stderr, argv
 
 from utils.extras import *
 
+version = "0.3.1"
 
 def flatten(args):
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(version=version)
     parser.add_argument('source', nargs=1, help='Source image name')
     parser.add_argument('target', nargs="?", help='Target image name')
     args = parser.parse_args(args)
@@ -49,9 +50,6 @@ def flatten(args):
     docker_run += " {image}".format(image=source)
 
     container_id = dockerRead(docker_run, connect=docker_connect).rstrip('\n')
-    log("Running the container: {0}".format(container_id))
-    # Run created docker container
-    dockerExec(Constants.Docker.RUN.format(container_id), connect=docker_connect)
 
     # Exporting container filesystem
     dockerExec(Constants.Docker.EXPORT.format(container_id=container_id), connect=docker_connect)
@@ -436,6 +434,41 @@ def rmi(args):
                        fail_on_error=False)
 
 
+def sync(args):
+    parser = argparse.ArgumentParser(version=version)
+    parser.add_argument('--source', type=str, required=True, help='Source image name')
+    parser.add_argument('--path', type=str, required=True, help='Resource to sync')
+    parser.add_argument('--flatten', type=bool, default=False, help='Flatten target images after sync')
+    parser.add_argument('target', nargs="+", help='Target image name(s)')
+    args = parser.parse_args(args)
+
+    folder_name = str(uuid4())
+    os.mkdir(folder_name)
+    absolute_folder_name = os.path.abspath(folder_name)
+    resource_path = os.path.dirname(args.path)
+    resource_name = os.path.basename(args.path)
+    commands = ["###RUNTIME###", "RUN mkdir -p {}".format(resource_path), "RUN rm -rf {0}".format(args.path),
+                "RUN cp -r /{0}/{1} {2}/".format(folder_name, resource_name, resource_path)]
+
+    run_command = "docker run -v {0}:/{1} {2} cp -r {3} /{1}/".format(absolute_folder_name, folder_name, args.source,
+                                                                      args.path)
+    dockerExec(run_command, docker_connect)
+
+    opts = ["-v", "{0}:/{1}".format(absolute_folder_name, folder_name)]
+    for command in commands:
+        opts.append("--command")
+        opts.append(command)
+
+    for target in args.target:
+        options = opts
+        options.append(target)
+        patch(options)
+        if args.flatten:
+            flatten([target])
+
+    shutil.rmtree(absolute_folder_name)
+
+
 def run(args):
     options = checkOptsFile(args)
     options.insert(0, "docker run")
@@ -460,9 +493,19 @@ if len(argv) == 1 or (len(argv) == 2 and argv[1] == "--help"):
     log("* patch - allows to patch existing Docker image; format:")
     log(
         "    dockerx patch [BUILD OPTIONS] --command '<DOCKER-INSTRUCTION>' [--command '<DOCKER-INSTRUCTION>'...] <IMAGE_NAME>")
+    log("* sync - synchronizes resource between source image and target images; format:")
+    log("    dockerx sync --source <SOURCE_IMAGE> --path=<PATH_TO_RESOURCE_INSIDE_SOURCE_IMAGE>  [--flatten=true] <TARGET_IMAGE> <TARGET_IMAGE>...")
     log("* flatten - reduces size of Docker images; format:")
     log("    dockerx flatten <IMAGE_NAME> [<TARGET_IMAGE_NAME>]")
+    log("* rmi - removes images using regex pattern; format:")
+    log("    dockerx rmi [-x <SKIPPED_IMAGE_NAME> -x <SKIPPED_IMAGE_NAME>... ] [<REGEX_PATTERN>]")
+    log("* run - allows to use arguments from options file; format:")
+    log("    dockerx run --opts-file=<FILENAME> ...")
     log("\nIf command not found, it will be passed to the regular docker script")
+    os._exit(1)
+
+if len(argv) == 2 and argv[1] == "--version":
+    log("dockerx version "+version+". Chegg Inc.")
     os._exit(1)
 
 command = argv[1]
@@ -479,6 +522,8 @@ elif command == 'run':
     func = run
 elif command == 'rmi':
     func = rmi
+elif command == 'sync':
+    func = sync
 
 if func is not None:
     args = argv[2:]

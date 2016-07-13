@@ -6,6 +6,7 @@
 - put build parameters into an options file
 - override base image name during build
 - patch existing images using command line instructions
+- synchronize a resource in source image with target images
 - flatten Docker images
 - remove images based on regular expression
 
@@ -83,6 +84,13 @@ Commands will be executed with their natural order. Methods can append context m
 After creating a **Dockerfile**, script will internally call **dockerx build**, and pass all arguments excluding _--command_.
    
    
+## sync
+**dockerx sync** will copy a resource (file or folder) from source image, and put it into all target images. If resource exists, it will be overwritten. Usage:
+<pre>dockerx sync --source &lt;SOURCE_IMAGE_NAME&gt; --path &lt;PATH_TO_RESOURCEgt; [--flatten=true] &lt;TARGET_IMAGE_NAME&gt; [&lt;TARGET_NAME&gt;...]</pre>
+
+### How it works?
+**dockerx** will create a temporary folder, run a container based on the source image, and copy the resource from the container into a temporary folder. Then it will patch each target image using **dockerx patch** to push the resource into these images. If _--flatten_ flag is set to **true**, **dockerx flatten** will be called after patching.
+         
    
 ## flatten
 **dockerx flatten** reduces size of Docker images. Usage:
